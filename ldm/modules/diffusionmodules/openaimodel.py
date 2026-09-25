@@ -432,8 +432,17 @@ class ResBlockDual(TimestepBlockDual):
         :param emb: an [N x emb_channels] Tensor of timestep embeddings.
         :return: an [N x C x ...] Tensor of outputs.
         """
+        # s_cond -- словарь {разрешение: тензор}. CheckpointFunction работает только
+        # с тензорами и считает градиенты только по ним, поэтому словарь
+        # раскладывается в отдельные аргументы -- иначе градиент не дойдёт
+        # до обучаемого structcond_stage_model.
+        keys = list(s_cond.keys())
+
+        def _forward_flat(x, emb, *s_vals):
+            return self._forward(x, emb, dict(zip(keys, s_vals)))
+
         return checkpoint(
-            self._forward, (x, emb, s_cond), self.parameters(), self.use_checkpoint
+            _forward_flat, (x, emb, *[s_cond[k] for k in keys]), self.parameters(), self.use_checkpoint
         )
 
 
