@@ -1,0 +1,191 @@
+sf: 4
+model:
+  base_learning_rate: 5.0e-05
+  target: ldm.models.diffusion.ddpm.LatentDiffusionSRTextWTPaired
+  params:
+    # parameterization: "v"
+    linear_start: 0.00085
+    linear_end: 0.0120
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: image
+    cond_stage_key: caption
+    image_size: 512
+    channels: 4
+    cond_stage_trainable: False   # Note: different from the one we trained before
+    conditioning_key: crossattn
+    monitor: val/loss_simple_ema
+    scale_factor: 0.18215
+    use_ema: False
+    # ОБЯЗАТЕЛЬНО: стартовые веса. Либо SD2.1-base, либо релизный StableSR
+    # (тогда дообучение идёт с уже обученного time-aware энкодера -- для T4 это единственный
+    # разумный вариант, обучать с нуля 20k шагов на T4 бессмысленно).
+    ckpt_path: /kaggle/input/stablesr/stablesr_000117.ckpt
+    unfrozen_diff: False
+    random_size: False
+    time_replace: 1000
+    use_usm: False    # на реальных парах шарпить GT нельзя -- ломает соответствие LQ-HQ
+    #P2 weighting, we do not use in final version
+    p2_gamma: ~
+    p2_k: ~
+    # ---- FFT-loss (перенос из PiSA-SR) ----
+    lambda_fft: 0.05        # 0 = выключено
+    fft_space: latent       # latent | pixel
+    fft_t_max_ratio: 0.4    # применять только при t < 0.4*T
+    fft_warmup: 500         # линейный разогрев веса, шагов
+    fft_patch: 0            # кроп латента для fft_space=pixel (напр. 32 -> 256x256 px)
+    # ignore_keys: []
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModelDualcondV2
+      params:
+        image_size: 32 # unused
+        in_channels: 4
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_head_channels: 64
+        use_spatial_transformer: True
+        use_linear_in_transformer: True
+        transformer_depth: 1
+        context_dim: 1024
+        use_checkpoint: True
+        legacy: False
+        semb_channels: 256
+
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        # веса VAE берутся из того же чекпоинта, отдельный ckpt_path не нужен,
+        # если ckpt_path модели выше содержит first_stage_model.*
+        # ckpt_path: /kaggle/input/stablesr/v2-1_512-ema-pruned.ckpt
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 512
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    cond_stage_config:
+      target: ldm.modules.encoders.modules.FrozenOpenCLIPEmbedder
+      params:
+        freeze: True
+        layer: "penultimate"
+
+    structcond_stage_config:
+      target: ldm.modules.diffusionmodules.openaimodel.EncoderUNetModelWT
+      params:
+        image_size: 96
+        in_channels: 4
+        model_channels: 256
+        out_channels: 256
+        num_res_blocks: 2
+        attention_resolutions: [ 4, 2, 1 ]
+        dropout: 0
+        channel_mult: [ 1, 1, 2, 2 ]
+        conv_resample: True
+        dims: 2
+        use_checkpoint: True
+        use_fp16: False
+        num_heads: 4
+        num_head_channels: -1
+        num_heads_upsample: -1
+        use_scale_shift_norm: False
+        resblock_updown: False
+        use_new_attention_order: False
+
+
+# Пайплайн синтетических деградаций не используется: LQ берётся из датасета как есть.
+# Оставлен только gt_size, на него смотрит код кропа.
+degradation:
+  gt_size: 512
+  no_degradation_prob: 0.0
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 2      # T4 16 ГБ; при OOM -> 1 и accumulate_grad_batches: 8
+    num_workers: 2
+    wrap: false
+    train:
+      target: basicsr.data.realesrgan_paired_dataset.RealESRGANPairedDataset
+      params:
+        dataroot_gt: /kaggle/input/<ваш-датасет>/train/HQ
+        dataroot_lq: /kaggle/input/<ваш-датасет>/train/LQ
+        io_backend:
+          type: disk
+        phase: train
+        scale: 4          # HQ 512 / LQ 128
+        gt_size: 512
+        use_hflip: True
+        use_rot: False
+    validation:
+      target: basicsr.data.realesrgan_paired_dataset.RealESRGANPairedDataset
+      params:
+        dataroot_gt: /kaggle/input/<ваш-датасет>/val/HQ
+        dataroot_lq: /kaggle/input/<ваш-датасет>/val/LQ
+        io_backend:
+          type: disk
+        phase: train
+        scale: 4          # HQ 512 / LQ 128
+        gt_size: 512
+        use_hflip: True
+        use_rot: False
+
+test_data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 2
+    wrap: false
+    test:
+      target: basicsr.data.realesrgan_paired_dataset.RealESRGANPairedDataset
+      params:
+        dataroot_gt: /kaggle/input/<ваш-датасет>/val/HQ
+        dataroot_lq: /kaggle/input/<ваш-датасет>/val/LQ
+        io_backend:
+          type: disk
+        phase: test
+        scale: 4          # HQ 512 / LQ 128
+        gt_size: 512
+        use_hflip: True
+        use_rot: False
+
+lightning:
+  modelcheckpoint:
+    params:
+      every_n_train_steps: 500
+      save_top_k: 1          # чекпоинт StableSR ~5-6 ГБ, на Kaggle /kaggle/working всего 20 ГБ
+      monitor: null          # валидация за 1500 шагов может не успеть запуститься
+      save_last: True
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 1000
+        max_images: 4
+        increase_log_steps: False
+
+  trainer:
+    benchmark: True
+    max_steps: 2000               # ШАГИ ОПТИМИЗАТОРА: 2000*4 = 8000 батчей = 16000 картинок ~ 2.3 эпохи
+    accumulate_grad_batches: 4    # эффективный батч 8
+    precision: 16
+    num_sanity_val_steps: 0
+    gpus: "0,"
