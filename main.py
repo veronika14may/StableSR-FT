@@ -148,7 +148,12 @@ def to_pl2_trainer_kwargs(trainer_config):
         kw["devices"] = [int(g) for g in str(gpus).strip(",").split(",")]
     else:
         kw["accelerator"] = "cpu"
-        kw["devices"] = 1
+        kw.setdefault("devices", 1)
+    n_dev = len(kw["devices"]) if isinstance(kw["devices"], list) else int(kw["devices"])
+    if n_dev > 1 and "strategy" not in kw:
+        # find_unused: часть выходов structcond-энкодера может не участвовать в loss,
+        # без этого DDP падает на втором шаге
+        kw["strategy"] = "ddp_find_unused_parameters_true"
     precision = kw.get("precision")
     if precision is not None and str(precision) in ("16", "bf16"):
         kw["precision"] = f"{precision}-mixed"
@@ -274,7 +279,7 @@ class SetupCallback(Callback):
         self.lightning_config = lightning_config
 
     def on_exception(self, trainer, pl_module, exception):
-        if isinstance(exception, KeyboardInterrupt) and trainer.global_rank == 0:
+        if isinstance(exception, KeyboardInterrupt) and trainer.world_size == 1:
             print("Summoning checkpoint.")
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
@@ -299,16 +304,8 @@ class SetupCallback(Callback):
             OmegaConf.save(OmegaConf.create({"lightning": self.lightning_config}),
                            os.path.join(self.cfgdir, "{}-lightning.yaml".format(self.now)))
 
-        else:
-            # ModelCheckpoint callback created log directory --- remove it
-            if not self.resume and os.path.exists(self.logdir):
-                dst, name = os.path.split(self.logdir)
-                dst = os.path.join(dst, "child_runs", name)
-                os.makedirs(os.path.split(dst)[0], exist_ok=True)
-                try:
-                    os.rename(self.logdir, dst)
-                except FileNotFoundError:
-                    pass
+        # В PL 1.x здесь rank > 0 переносил logdir в child_runs. В PL 2.x все процессы DDP
+        # пишут в один logdir (см. STABLESR_RUN_NOW), и перенос утащил бы файлы rank 0.
 
 
 class ImageLogger(Callback):
@@ -418,12 +415,16 @@ class ImageLogger(Callback):
 class CUDACallback(Callback):
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
     def on_train_epoch_start(self, trainer, pl_module):
+        if pl_module.device.type != "cuda":
+            return
         # Reset the memory use counter
         torch.cuda.reset_peak_memory_stats(pl_module.device)
         torch.cuda.synchronize(pl_module.device)
         self.start_time = time.time()
 
     def on_train_epoch_end(self, trainer, pl_module):
+        if pl_module.device.type != "cuda":
+            return
         torch.cuda.synchronize(pl_module.device)
         max_memory = torch.cuda.max_memory_allocated(pl_module.device) / 2 ** 20
         epoch_time = time.time() - self.start_time
@@ -481,7 +482,8 @@ if __name__ == "__main__":
     #           params:
     #               key: value
 
-    now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    now = os.environ.get("STABLESR_RUN_NOW") or datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    os.environ["STABLESR_RUN_NOW"] = now  # наследуется дочерними процессами DDP
 
     # add cwd for convenience and to make classes in this file available when
     # running as `python main.py`
@@ -738,7 +740,8 @@ if __name__ == "__main__":
     # allow checkpointing via USR1
     def melk(*args, **kwargs):
         # run all checkpoint hooks
-        if trainer.global_rank == 0:
+        # при DDP после падения одного процесса save_checkpoint зависнет на barrier
+        if trainer.world_size == 1 and trainer.global_rank == 0:
             print("Summoning checkpoint.")
             ckpt_path = os.path.join(ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
