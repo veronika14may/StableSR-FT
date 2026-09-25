@@ -14,13 +14,11 @@ from PIL import Image
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from pytorch_lightning.utilities.distributed import rank_zero_only
-# from pytorch_lightning.utilities.rank_zero import rank_zero_only
-from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.utilities.rank_zero import rank_zero_only, rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config, instantiate_from_config_sr
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import WandbLogger, CSVLogger
 
 
 def get_parser(**parser_kwargs):
@@ -122,14 +120,39 @@ def get_parser(**parser_kwargs):
         default=False,
         help="scale base-lr by ngpu * batch_size * n_accumulate",
     )
+    # В PL 2.x нет Trainer.add_argparse_args: аргументы Trainer, которые
+    # переопределяют lightning.trainer из конфига, перечислены явно.
+    parser.add_argument("--gpus", type=str, default=None, help='например "0,"')
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=None)
+    parser.add_argument("--precision", type=str, default=None)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     return parser
 
 
+TRAINER_CLI_ARGS = ("gpus", "max_steps", "accumulate_grad_batches", "precision", "resume_from_checkpoint")
+
+
 def nondefault_trainer_args(opt):
-    parser = argparse.ArgumentParser()
-    parser = Trainer.add_argparse_args(parser)
-    args = parser.parse_args([])
-    return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
+    return sorted(k for k in TRAINER_CLI_ARGS if getattr(opt, k) is not None)
+
+
+def to_pl2_trainer_kwargs(trainer_config):
+    """Переводит trainer-конфиг в стиле PL 1.4 в аргументы Trainer PL 2.x."""
+    kw = OmegaConf.to_container(trainer_config, resolve=True)
+    kw.pop("accelerator", None)
+    kw.pop("resume_from_checkpoint", None)  # в PL 2.x передаётся в fit(ckpt_path=...)
+    gpus = kw.pop("gpus", None)
+    if gpus is not None and str(gpus).strip(","):
+        kw["accelerator"] = "gpu"
+        kw["devices"] = [int(g) for g in str(gpus).strip(",").split(",")]
+    else:
+        kw["accelerator"] = "cpu"
+        kw["devices"] = 1
+    precision = kw.get("precision")
+    if precision is not None and str(precision) in ("16", "bf16"):
+        kw["precision"] = f"{precision}-mixed"
+    return kw
 
 
 class WrappedDataset(Dataset):
@@ -250,13 +273,13 @@ class SetupCallback(Callback):
         self.config = config
         self.lightning_config = lightning_config
 
-    def on_keyboard_interrupt(self, trainer, pl_module):
-        if trainer.global_rank == 0:
+    def on_exception(self, trainer, pl_module, exception):
+        if isinstance(exception, KeyboardInterrupt) and trainer.global_rank == 0:
             print("Summoning checkpoint.")
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
 
-    def on_pretrain_routine_start(self, trainer, pl_module):
+    def on_fit_start(self, trainer, pl_module):
         if trainer.global_rank == 0:
             # Create logdirs and save configs
             os.makedirs(self.logdir, exist_ok=True)
@@ -296,9 +319,7 @@ class ImageLogger(Callback):
         self.rescale = rescale
         self.batch_freq = batch_frequency
         self.max_images = max_images
-        self.logger_log_images = {
-            pl.loggers.TestTubeLogger: self._testtube,
-        }
+        self.logger_log_images = {}  # TestTubeLogger удалён в PL 2.x; картинки пишутся в logdir/images
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
@@ -382,11 +403,11 @@ class ImageLogger(Callback):
             return True
         return False
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         if not self.disabled and (pl_module.global_step > 0 or self.log_first_step):
             self.log_img(pl_module, batch, batch_idx, split="train")
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         if not self.disabled and pl_module.global_step > 0:
             self.log_img(pl_module, batch, batch_idx, split="val")
         if hasattr(pl_module, 'calibrate_grad_norm'):
@@ -398,18 +419,18 @@ class CUDACallback(Callback):
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
     def on_train_epoch_start(self, trainer, pl_module):
         # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
-        torch.cuda.synchronize(trainer.root_gpu)
+        torch.cuda.reset_peak_memory_stats(pl_module.device)
+        torch.cuda.synchronize(pl_module.device)
         self.start_time = time.time()
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
-        torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+    def on_train_epoch_end(self, trainer, pl_module):
+        torch.cuda.synchronize(pl_module.device)
+        max_memory = torch.cuda.max_memory_allocated(pl_module.device) / 2 ** 20
         epoch_time = time.time() - self.start_time
 
         try:
-            max_memory = trainer.training_type_plugin.reduce(max_memory)
-            epoch_time = trainer.training_type_plugin.reduce(epoch_time)
+            max_memory = trainer.strategy.reduce(max_memory)
+            epoch_time = trainer.strategy.reduce(epoch_time)
 
             rank_zero_info(f"Average Epoch time: {epoch_time:.2f} seconds")
             rank_zero_info(f"Average Peak memory {max_memory:.2f}MiB")
@@ -468,7 +489,6 @@ if __name__ == "__main__":
     sys.path.append(os.getcwd())
 
     parser = get_parser()
-    parser = Trainer.add_argparse_args(parser)
 
     opt, unknown = parser.parse_known_args()
     if opt.name and opt.resume:
@@ -532,12 +552,9 @@ if __name__ == "__main__":
     lightning_config = config.pop("lightning", OmegaConf.create())
     # merge trainer cli with config
     trainer_config = lightning_config.get("trainer", OmegaConf.create())
-    # default to ddp
-    trainer_config["accelerator"] = "ddp"
     for k in nondefault_trainer_args(opt):
         trainer_config[k] = getattr(opt, k)
     if not "gpus" in trainer_config:
-        del trainer_config["accelerator"]
         cpu = True
     else:
         gpuinfo = trainer_config["gpus"]
@@ -573,9 +590,15 @@ if __name__ == "__main__":
             }
         },
     }
-    # We use wandb by default. Change to testtube if you do not want to use wandb
-    default_logger_cfg = default_logger_cfgs["wandb"]
-    os.makedirs(os.path.join(logdir, 'wandb'), exist_ok=True)
+    default_logger_cfgs["csv"] = {
+        "target": "pytorch_lightning.loggers.CSVLogger",
+        "params": {
+            "name": "csv",
+            "save_dir": logdir,
+        }
+    }
+    # wandb на Kaggle без API-ключа падает, testtube удалён в PL 2.x -> CSV (logdir/csv/version_0/metrics.csv)
+    default_logger_cfg = default_logger_cfgs["csv"]
     if "logger" in lightning_config:
         logger_cfg = lightning_config.logger
     else:
@@ -675,7 +698,7 @@ if __name__ == "__main__":
 
     trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
 
-    trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+    trainer = Trainer(**to_pl2_trainer_kwargs(trainer_config), **trainer_kwargs)
     trainer.logdir = logdir  ###
 
     # data
@@ -735,9 +758,9 @@ if __name__ == "__main__":
     # run
     if opt.train:
         try:
-            trainer.fit(model, data)
+            trainer.fit(model, data, ckpt_path=getattr(opt, "resume_from_checkpoint", None))
         except Exception:
             melk()
             raise
-    if not opt.no_test and not trainer.interrupted:
+    if not opt.no_test and not trainer.interrupted and "test" in data.dataset_configs:
         trainer.test(model, data)

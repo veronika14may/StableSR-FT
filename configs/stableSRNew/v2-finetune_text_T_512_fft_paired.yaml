@@ -188,4 +188,5 @@ lightning:
     accumulate_grad_batches: 4    # эффективный батч 8
     precision: 16
     num_sanity_val_steps: 0
+    log_every_n_steps: 10         # по умолчанию 50 -- на коротком прогоне в metrics.csv почти ничего не попадёт
     gpus: "0,"

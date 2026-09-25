@@ -1,14 +1,20 @@
 import torch
 import torch.nn as nn
 from functools import partial
-import clip
+try:  # openai-clip нужен только FrozenClipImageEmbedder
+    import clip
+except ImportError:
+    clip = None
 from einops import rearrange, repeat
 import transformers
 from transformers import CLIPTokenizer, CLIPTextModel
 import kornia
 
 from ldm.modules.x_transformer import Encoder, TransformerWrapper  # TODO: can we directly rely on lucidrains code and simply add this as a reuirement? --> test
-from .transformer_utils import CLIPTextTransformer_M
+try:  # старый API transformers; в конфиге StableSR не используется
+    from .transformer_utils import CLIPTextTransformer_M
+except Exception:
+    CLIPTextTransformer_M = None
 import open_clip
 
 
@@ -179,9 +185,13 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
     def encode_with_transformer(self, text):
         x = self.model.token_embedding(text)  # [batch_size, n_ctx, d_model]
         x = x + self.model.positional_embedding
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        # open_clip >= 2.23 держит трансформер в batch_first, старые версии -- в LND
+        batch_first = getattr(self.model.transformer, "batch_first", False)
+        if not batch_first:
+            x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.text_transformer_forward(x, attn_mask=self.model.attn_mask)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        if not batch_first:
+            x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.model.ln_final(x)
         return x
 
